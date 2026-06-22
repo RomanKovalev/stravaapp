@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.shortcuts import redirect
 from rest_framework import status
 from rest_framework.authtoken.models import Token
 from rest_framework.decorators import api_view, permission_classes
@@ -27,7 +28,12 @@ User = get_user_model()
 def strava_login(request):
     state = secrets.token_urlsafe(32)
     cache.set(f'strava_oauth_state:{state}', True, timeout=600)
-    return Response({'authorization_url': get_authorization_url(state)})
+    authorization_url = get_authorization_url(state)
+
+    if request.query_params.get('format') == 'json':
+        return Response({'authorization_url': authorization_url})
+
+    return redirect(authorization_url)
 
 
 @api_view(['GET'])

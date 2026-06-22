@@ -39,6 +39,7 @@ def exchange_code_for_token(code):
             'client_secret': settings.STRAVA_CLIENT_SECRET,
             'code': code,
             'grant_type': 'authorization_code',
+            'redirect_uri': settings.STRAVA_REDIRECT_URI,
         },
         timeout=30,
     )
