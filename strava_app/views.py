@@ -10,10 +10,13 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
 from strava_app.models import StravaAccount
+from strava_app.serializers import AthleteSerializer
 from strava_app.services.strava_client import (
     StravaAPIError,
     exchange_code_for_token,
+    fetch_athlete,
     get_authorization_url,
+    get_valid_access_token,
 )
 
 User = get_user_model()
@@ -63,3 +66,24 @@ def strava_callback(request):
 
     token, _ = Token.objects.get_or_create(user=user)
     return Response({'token': token.key, 'athlete_id': athlete_id})
+
+
+@api_view(['GET'])
+def athlete_detail(request):
+    try:
+        account = request.user.strava_account
+    except StravaAccount.DoesNotExist:
+        return Response(
+            {'error': 'Strava account not connected.'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    try:
+        access_token = get_valid_access_token(account)
+        athlete_data = fetch_athlete(access_token)
+    except StravaAPIError as exc:
+        return Response({'error': exc.message}, status=exc.status_code)
+
+    serializer = AthleteSerializer(data=athlete_data)
+    serializer.is_valid(raise_exception=True)
+    return Response(serializer.data)
