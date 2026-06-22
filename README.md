@@ -1,6 +1,6 @@
 # stravaapp
 
-Django REST API with Strava OAuth authentication.
+Django REST API with Strava OAuth authentication and JWT.
 
 ## Setup
 
@@ -31,16 +31,49 @@ GET /api/auth/strava/login/?format=json
 
 ### 2. OAuth callback
 
-Strava redirects to `/api/auth/strava/callback/?code=...&state=...`
+Strava redirects to `/api/auth/strava/callback?code=...&state=...`
 
-Response: `{ "token": "...", "athlete_id": 12345 }`
+Response:
+
+```json
+{
+  "athlete_id": 12345,
+  "access": "<jwt_access_token>",
+  "refresh": "<jwt_refresh_token>"
+}
+```
 
 ### 3. Get athlete profile
 
 ```
 GET /api/athlete/
-Authorization: Token <token>
+Authorization: Bearer <access_token>
 ```
+
+### 4. Refresh access token
+
+```
+POST /api/auth/token/refresh/
+Content-Type: application/json
+
+{"refresh": "<refresh_token>"}
+```
+
+### 5. Logout
+
+```
+POST /api/auth/logout/
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{"refresh": "<refresh_token>"}
+```
+
+## JWT settings
+
+- Access token lifetime: 60 minutes
+- Refresh token lifetime: 30 days
+- Refresh tokens rotate on use and old ones are blacklisted
 
 ## Strava app settings
 
@@ -50,3 +83,7 @@ In [strava.com/settings/api](https://www.strava.com/settings/api) → Edit Appli
 - **Redirect URI used by this app:** `http://13.51.255.182:8080/api/auth/strava/callback`
 
 Strava does not allow port numbers in the Callback Domain field. The port belongs only in `redirect_uri`.
+
+## Mobile integration
+
+See [docs/MOBILE_API.md](docs/MOBILE_API.md).

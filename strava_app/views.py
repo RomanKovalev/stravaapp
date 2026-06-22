@@ -5,10 +5,13 @@ from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.shortcuts import redirect
 from rest_framework import status
-from rest_framework.authtoken.models import Token
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.tokens import RefreshToken
+
+from strava_app.auth import get_tokens_for_user
 
 from strava_app.models import StravaAccount
 from strava_app.serializers import AthleteSerializer
@@ -70,8 +73,23 @@ def strava_callback(request):
     account.athlete_data = athlete
     account.save()
 
-    token, _ = Token.objects.get_or_create(user=user)
-    return Response({'token': token.key, 'athlete_id': athlete_id})
+    tokens = get_tokens_for_user(user)
+    return Response({'athlete_id': athlete_id, **tokens})
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def logout(request):
+    refresh = request.data.get('refresh')
+    if not refresh:
+        return Response({'error': 'Refresh token is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        RefreshToken(refresh).blacklist()
+    except TokenError:
+        return Response({'error': 'Invalid refresh token.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response({'detail': 'Successfully logged out.'})
 
 
 @api_view(['GET'])

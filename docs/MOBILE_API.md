@@ -20,7 +20,8 @@ The backend uses a two-layer token model:
 
 | Token | Issued by | Used by mobile client? | Purpose |
 |-------|-----------|------------------------|---------|
-| **DRF Token** | StravaApp backend | **Yes** | Authenticate all API requests |
+| **JWT access token** | StravaApp backend | **Yes** | Authenticate API requests (60 min lifetime) |
+| **JWT refresh token** | StravaApp backend | **Yes** | Obtain new access token without re-login (30 days) |
 | Strava access/refresh token | Strava | **No** | Stored server-side; backend uses them to call Strava API |
 
 The mobile app never sees or stores Strava tokens directly.
@@ -33,9 +34,10 @@ Mobile App
   → Open URL in in-app browser (WebView / ASWebAuthenticationSession)
   → User authorizes on Strava
   → Strava redirects to backend callback
-  → Mobile app intercepts callback URL and reads token from JSON response
-  → Store DRF token securely
-  → Use DRF token in Authorization header for all subsequent requests
+  → Mobile app intercepts callback URL and reads JWT from JSON response
+  → Store access + refresh tokens securely
+  → Use access token: Authorization: Bearer <access>
+  → When access expires: POST /api/auth/token/refresh/
 ```
 
 ---
@@ -87,15 +89,22 @@ This endpoint is called by Strava, not directly by the mobile app. The mobile ap
 
 ```json
 {
-  "token": "f24b4cb7072afa43519ee04ed66e8b3122f19c1d",
-  "athlete_id": 3226679
+  "athlete_id": 3226679,
+  "access": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refresh": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `token` | string | DRF API token — store securely, use for all API calls |
+| `access` | string | JWT access token — use in `Authorization: Bearer` header (expires in 60 min) |
+| `refresh` | string | JWT refresh token — use to obtain new access token (expires in 30 days) |
 | `athlete_id` | integer | Strava athlete ID |
+
+**Mobile action after success:**
+1. Close the in-app browser.
+2. Save `access` and `refresh` to secure storage (iOS Keychain / Android EncryptedSharedPreferences).
+3. Optionally save `athlete_id` for display purposes.
 
 **Error responses**
 
@@ -105,11 +114,6 @@ This endpoint is called by Strava, not directly by the mobile app. The mobile ap
 | `400` | `{"error": "Invalid OAuth state."}` | `state` expired, reused, or login URL was regenerated |
 | `502` | `{"error": "Failed to obtain Strava token: ..."}` | Strava token exchange failed |
 
-**Mobile action after success:**
-1. Close the in-app browser.
-2. Save `token` to secure storage (iOS Keychain / Android EncryptedSharedPreferences).
-3. Optionally save `athlete_id` for display purposes.
-
 ---
 
 ### 3. Get athlete profile
@@ -118,7 +122,7 @@ This endpoint is called by Strava, not directly by the mobile app. The mobile ap
 
 ```
 GET /api/athlete/
-Authorization: Token <drf_token>
+Authorization: Bearer <access_token>
 ```
 
 Authentication required.
@@ -157,11 +161,80 @@ All fields except `id` may be `null` depending on athlete privacy settings.
 | Status | Body | Cause |
 |--------|------|-------|
 | `401` | `{"detail": "Authentication credentials were not provided."}` | Missing `Authorization` header |
-| `401` | `{"detail": "Invalid token."}` | Token is wrong or revoked |
+| `401` | `{"detail": "Given token not valid for any token type"}` | Access token expired or invalid — refresh or re-login |
 | `404` | `{"error": "Strava account not connected."}` | User has no linked Strava account |
 | `401` | `{"error": "Strava access token is invalid or expired."}` | Server-side Strava token issue |
 | `429` | `{"error": "Strava rate limit exceeded."}` | Too many Strava API calls |
 | `502` | `{"error": "Strava API error: ..."}` | Strava API unavailable |
+
+---
+
+### 4. Refresh access token
+
+**Request**
+
+```
+POST /api/auth/token/refresh/
+Content-Type: application/json
+
+{
+  "refresh": "<refresh_token>"
+}
+```
+
+No `Authorization` header required.
+
+**Success response `200 OK`**
+
+```json
+{
+  "access": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refresh": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+}
+```
+
+> When refresh token rotation is enabled, a new `refresh` token is also returned. Always replace the stored refresh token with the new one.
+
+**Error responses**
+
+| Status | Body | Cause |
+|--------|------|-------|
+| `401` | `{"detail": "Token is invalid or expired"}` | Refresh token expired or blacklisted — re-login via Strava |
+
+**Mobile action:** Call this when API returns `401` on access token. Update stored `access` (and `refresh` if returned).
+
+---
+
+### 5. Logout
+
+**Request**
+
+```
+POST /api/auth/logout/
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "refresh": "<refresh_token>"
+}
+```
+
+**Success response `200 OK`**
+
+```json
+{
+  "detail": "Successfully logged out."
+}
+```
+
+**Error responses**
+
+| Status | Body | Cause |
+|--------|------|-------|
+| `400` | `{"error": "Refresh token is required."}` | Missing `refresh` in body |
+| `400` | `{"error": "Invalid refresh token."}` | Refresh token already blacklisted or malformed |
+
+**Mobile action:** Clear stored tokens locally after successful logout.
 
 ---
 
@@ -180,12 +253,14 @@ This works with the current API without backend changes.
 4. Monitor navigation URL on every page load / redirect
 5. When URL contains "/api/auth/strava/callback":
      a. Make HTTP GET to that full URL (or read response body from WebView)
-     b. Parse JSON: { token, athlete_id }
-     c. Save token to secure storage
+     b. Parse JSON: { access, refresh, athlete_id }
+     c. Save access + refresh to secure storage
      d. Close in-app browser
      e. Navigate to authenticated home screen
 6. For all API calls, add header:
-     Authorization: Token <saved_token>
+     Authorization: Bearer <access>
+7. On 401 — call POST /api/auth/token/refresh/ with stored refresh token
+8. On logout — call POST /api/auth/logout/ and clear local tokens
 ```
 
 #### Callback URL pattern to intercept
@@ -211,10 +286,10 @@ let (data, _) = try await URLSession.shared.data(from: loginURL)
 let response = try JSONDecoder().decode(LoginResponse.self, from: data)
 
 // Open response.authorization_url in ASWebAuthenticationSession
-// On redirect to callback URL — fetch the URL and parse JSON token
+// On redirect to callback URL — fetch the URL and parse access + refresh tokens
 ```
 
-Store token in **Keychain**.
+Store `access` and `refresh` in **Keychain**.
 
 #### Android (Kotlin)
 
@@ -224,13 +299,15 @@ Use **Chrome Custom Tabs** or **WebView** with `WebViewClient.shouldOverrideUrlL
 // Pseudocode
 if (url.contains("/api/auth/strava/callback")) {
     val response = httpClient.get(url)
-    val token = response.token
-    encryptedPrefs.edit().putString("api_token", token).apply()
+    encryptedPrefs.edit()
+        .putString("access_token", response.access)
+        .putString("refresh_token", response.refresh)
+        .apply()
     closeWebView()
 }
 ```
 
-Store token in **EncryptedSharedPreferences**.
+Store tokens in **EncryptedSharedPreferences**.
 
 #### React Native
 
@@ -243,15 +320,28 @@ async function loginWithStrava() {
   const res = await fetch(`${API_BASE}/api/auth/strava/login/?format=json`);
   const { authorization_url } = await res.json();
 
-  // Open WebView, watch for navigation state changes:
   const onNavigationStateChange = async (navState) => {
     if (navState.url.includes('/api/auth/strava/callback')) {
       const callbackRes = await fetch(navState.url);
-      const { token, athlete_id } = await callbackRes.json();
-      await SecureStore.setItemAsync('api_token', token);
-      // close WebView, navigate to home
+      const { access, refresh, athlete_id } = await callbackRes.json();
+      await SecureStore.setItemAsync('access_token', access);
+      await SecureStore.setItemAsync('refresh_token', refresh);
     }
   };
+}
+
+async function refreshAccessToken(refresh) {
+  const res = await fetch(`${API_BASE}/api/auth/token/refresh/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ refresh }),
+  });
+  const data = await res.json();
+  await SecureStore.setItemAsync('access_token', data.access);
+  if (data.refresh) {
+    await SecureStore.setItemAsync('refresh_token', data.refresh);
+  }
+  return data.access;
 }
 ```
 
@@ -262,13 +352,13 @@ async function loginWithStrava() {
 All protected endpoints require this header:
 
 ```
-Authorization: Token <drf_token>
+Authorization: Bearer <access_token>
 ```
 
 Example:
 
 ```bash
-curl -H "Authorization: Token f24b4cb7072afa43519ee04ed66e8b3122f19c1d" \
+curl -H "Authorization: Bearer <access_token>" \
   http://13.51.255.182:8080/api/athlete/
 ```
 
@@ -276,10 +366,12 @@ curl -H "Authorization: Token f24b4cb7072afa43519ee04ed66e8b3122f19c1d" \
 
 | Property | Value |
 |----------|-------|
-| Expiration | DRF tokens do not expire automatically |
-| Re-login | Same Strava athlete → same Django user → same token returned |
-| Invalidation | No logout endpoint yet; delete token server-side via Django admin |
-| Storage | Must be stored securely on device; treat like a password |
+| Access token lifetime | 60 minutes |
+| Refresh token lifetime | 30 days |
+| Refresh rotation | New refresh token issued on each refresh; old one blacklisted |
+| Re-login | Same Strava athlete → same Django user → new JWT pair |
+| Logout | `POST /api/auth/logout/` blacklists refresh token |
+| Storage | Store both tokens securely; treat refresh token like a password |
 
 ---
 
@@ -288,7 +380,8 @@ curl -H "Authorization: Token f24b4cb7072afa43519ee04ed66e8b3122f19c1d" \
 | Scenario | HTTP status | Mobile app action |
 |----------|-------------|-------------------|
 | No token stored | — | Show login screen |
-| `401 Invalid token` | 401 | Clear stored token, show login screen |
+| `401` on API call | 401 | Try `POST /api/auth/token/refresh/` |
+| Refresh also fails | 401 | Clear tokens, show login screen |
 | `Invalid OAuth state` | 400 | Restart login from step 1 |
 | User denied Strava access | redirect with `?error=access_denied` | Show "Authorization denied" message |
 | Network error | — | Show retry UI |
@@ -317,8 +410,6 @@ The following are **not yet implemented** on the backend. Mobile app should be a
 |---------|--------|------------|
 | `POST /api/auth/strava/token/` (send code directly) | Not implemented | Use WebView URL interception |
 | Deep link redirect (`myapp://auth?token=...`) | Not implemented | Use WebView URL interception |
-| Logout endpoint | Not implemented | Clear token locally |
-| Token refresh endpoint | Not implemented | DRF token does not expire |
 | Activities list endpoint | Not implemented | Only `/api/athlete/` available |
 | HTTPS | Not configured | Required before production release |
 
@@ -338,11 +429,13 @@ sequenceDiagram
     Mobile->>Browser: Open authorization_url
     Browser->>Strava: User logs in and authorizes
     Strava->>API: GET /api/auth/strava/callback?code&state
-    API-->>Browser: { token, athlete_id }
+    API-->>Browser: { access, refresh, athlete_id }
     Browser-->>Mobile: Intercept callback URL / read JSON
-    Mobile->>Mobile: Save token to secure storage
-    Mobile->>API: GET /api/athlete/ (Authorization: Token ...)
+    Mobile->>Mobile: Save tokens to secure storage
+    Mobile->>API: GET /api/athlete/ (Authorization: Bearer ...)
     API-->>Mobile: Athlete profile JSON
+    Mobile->>API: POST /api/auth/token/refresh/ (when access expires)
+    API-->>Mobile: { access, refresh }
 ```
 
 ---
@@ -356,12 +449,19 @@ sequenceDiagram
 
 2. Open `authorization_url` in browser, authorize.
 
-3. Copy `token` from callback JSON response.
+3. Copy `access` and `refresh` from callback JSON response.
 
 4. Test athlete endpoint:
    ```
-   curl -H "Authorization: Token <token>" \
+   curl -H "Authorization: Bearer <access>" \
      http://13.51.255.182:8080/api/athlete/
+   ```
+
+5. Test refresh:
+   ```
+   curl -X POST http://13.51.255.182:8080/api/auth/token/refresh/ \
+     -H "Content-Type: application/json" \
+     -d '{"refresh": "<refresh>"}'
    ```
 
 ---
@@ -369,4 +469,4 @@ sequenceDiagram
 ## Contact / backend repo
 
 - Repository: https://github.com/RomanKovalev/stravaapp
-- Backend stack: Django 6 + Django REST Framework + Strava API v3
+- Backend stack: Django 6 + Django REST Framework + SimpleJWT + Strava API v3
