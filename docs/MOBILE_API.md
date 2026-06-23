@@ -26,19 +26,25 @@ The backend uses a two-layer token model:
 
 The mobile app never sees or stores Strava tokens directly.
 
-### Auth flow summary
+### Auth flow summary (recommended — deep link)
 
 ```
 Mobile App
-  → GET /api/auth/strava/login/?format=json     (get Strava authorization URL)
-  → Open URL in in-app browser (WebView / ASWebAuthenticationSession)
+  → GET /api/auth/strava/login/?format=json&mobile=1
+  → Open authorization_url in in-app browser
   → User authorizes on Strava
-  → Strava redirects to backend callback
-  → Mobile app intercepts callback URL and reads JWT from JSON response
+  → Strava redirects to backend HTTP callback
+  → Backend redirects to stravaapp://auth?code=<one_time_code>
+  → OS opens the app via deep link
+  → POST /api/auth/strava/token/ { "code": "..." }
   → Store access + refresh tokens securely
   → Use access token: Authorization: Bearer <access>
   → When access expires: POST /api/auth/token/refresh/
 ```
+
+### Auth flow summary (legacy — WebView JSON interception)
+
+Without `mobile=1`, the callback returns JSON directly. The mobile app can intercept the HTTP callback URL and parse the response body. See [Legacy flow](#legacy-webview-json-interception) below.
 
 ---
 
@@ -49,12 +55,13 @@ Mobile App
 **Request**
 
 ```
-GET /api/auth/strava/login/?format=json
+GET /api/auth/strava/login/?format=json&mobile=1
 ```
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `format=json` | **Yes for mobile** | Returns JSON instead of HTTP redirect |
+| `mobile=1` | **Yes for deep link flow** | After OAuth, backend redirects to `stravaapp://auth?code=...` instead of returning JSON |
 
 No authentication required.
 
@@ -75,7 +82,7 @@ No authentication required.
 
 ---
 
-### 2. OAuth callback (handled by backend, intercepted by mobile)
+### 2. OAuth callback (handled by backend)
 
 After the user authorizes on Strava, Strava redirects to:
 
@@ -83,7 +90,38 @@ After the user authorizes on Strava, Strava redirects to:
 GET /api/auth/strava/callback?code=<authorization_code>&state=<state>&scope=read
 ```
 
-This endpoint is called by Strava, not directly by the mobile app. The mobile app must **intercept** this redirect inside the in-app browser.
+This endpoint is called by Strava, not directly by the mobile app.
+
+#### Mobile flow (`mobile=1` was used at login)
+
+Backend responds with `302 Found` and `Location: stravaapp://auth?code=<one_time_code>`.
+
+The mobile app must register the `stravaapp` URL scheme and handle the deep link. The one-time code expires in **60 seconds** and can be used only once.
+
+**Deep link success example:**
+
+```
+stravaapp://auth?code=AbCdEf123...
+```
+
+**Deep link error examples:**
+
+| Deep link | Cause |
+|-----------|-------|
+| `stravaapp://auth?error=access_denied` | User denied Strava authorization |
+| `stravaapp://auth?error=missing_code` | No `code` in Strava callback |
+| `stravaapp://auth?error=invalid_state` | OAuth `state` expired or reused (only when state was known) |
+| `stravaapp://auth?error=token_exchange` | Strava token exchange failed |
+
+**Mobile action after success deep link:**
+
+1. Close the in-app browser.
+2. Call `POST /api/auth/strava/token/` with the `code` from the deep link.
+3. Save `access` and `refresh` from the response to secure storage.
+
+#### Legacy flow (no `mobile=1` at login)
+
+Returns JSON directly — see [Legacy WebView JSON interception](#legacy-webview-json-interception).
 
 **Success response `200 OK`**
 
@@ -101,22 +139,54 @@ This endpoint is called by Strava, not directly by the mobile app. The mobile ap
 | `refresh` | string | JWT refresh token — use to obtain new access token (expires in 30 days) |
 | `athlete_id` | integer | Strava athlete ID |
 
-**Mobile action after success:**
-1. Close the in-app browser.
-2. Save `access` and `refresh` to secure storage (iOS Keychain / Android EncryptedSharedPreferences).
-3. Optionally save `athlete_id` for display purposes.
-
-**Error responses**
+**Error responses (legacy JSON)**
 
 | Status | Body | Cause |
 |--------|------|-------|
 | `400` | `{"error": "Missing authorization code."}` | No `code` in callback URL |
 | `400` | `{"error": "Invalid OAuth state."}` | `state` expired, reused, or login URL was regenerated |
+| `400` | `{"error": "access_denied"}` | User denied Strava authorization |
 | `502` | `{"error": "Failed to obtain Strava token: ..."}` | Strava token exchange failed |
 
 ---
 
-### 3. Get athlete profile
+### 3. Exchange one-time code for JWT (mobile deep link flow)
+
+**Request**
+
+```
+POST /api/auth/strava/token/
+Content-Type: application/json
+
+{
+  "code": "<one_time_code_from_deep_link>"
+}
+```
+
+No authentication required.
+
+**Success response `200 OK`**
+
+```json
+{
+  "athlete_id": 3226679,
+  "access": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refresh": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+}
+```
+
+**Error responses**
+
+| Status | Body | Cause |
+|--------|------|-------|
+| `400` | `{"error": "Code is required."}` | Missing `code` in body |
+| `400` | `{"error": "Invalid or expired code."}` | Code expired (>60 s), already used, or invalid |
+
+**Mobile action:** Save `access` and `refresh` to secure storage after success.
+
+---
+
+### 4. Get athlete profile
 
 **Request**
 
@@ -169,7 +239,7 @@ All fields except `id` may be `null` depending on athlete privacy settings.
 
 ---
 
-### 4. Refresh access token
+### 5. Refresh access token
 
 **Request**
 
@@ -205,7 +275,7 @@ No `Authorization` header required.
 
 ---
 
-### 5. Logout
+### 6. Logout
 
 **Request**
 
@@ -240,28 +310,60 @@ Content-Type: application/json
 
 ## Mobile Integration Guide
 
-### Recommended: WebView / in-app browser with URL interception
-
-This works with the current API without backend changes.
+### Recommended: Deep link flow
 
 #### Step-by-step
 
 ```
-1. Call GET /api/auth/strava/login/?format=json
+1. Call GET /api/auth/strava/login/?format=json&mobile=1
 2. Extract authorization_url from response
 3. Open authorization_url in in-app browser
-4. Monitor navigation URL on every page load / redirect
-5. When URL contains "/api/auth/strava/callback":
-     a. Make HTTP GET to that full URL (or read response body from WebView)
-     b. Parse JSON: { access, refresh, athlete_id }
-     c. Save access + refresh to secure storage
-     d. Close in-app browser
-     e. Navigate to authenticated home screen
-6. For all API calls, add header:
-     Authorization: Bearer <access>
-7. On 401 — call POST /api/auth/token/refresh/ with stored refresh token
-8. On logout — call POST /api/auth/logout/ and clear local tokens
+4. After Strava authorization, backend redirects to stravaapp://auth?code=...
+5. App handles deep link (Linking / ASWebAuthenticationSession callback)
+6. POST /api/auth/strava/token/ with { "code": "..." }
+7. Save access + refresh to secure storage
+8. Close in-app browser
+9. For all API calls: Authorization: Bearer <access>
+10. On 401 — POST /api/auth/token/refresh/
+11. On logout — POST /api/auth/logout/ and clear local tokens
 ```
+
+#### Deep link to register
+
+```
+stravaapp://auth
+```
+
+- **iOS:** `CFBundleURLSchemes` → `stravaapp`; use `ASWebAuthenticationSession` with `callbackURLScheme: "stravaapp"`
+- **Android:** intent-filter with `android:scheme="stravaapp"` and `android:host="auth"`
+
+#### React Native example
+
+```javascript
+const API_BASE = 'http://13.51.255.182:8080';
+
+async function loginWithStrava() {
+  const res = await fetch(`${API_BASE}/api/auth/strava/login/?format=json&mobile=1`);
+  const { authorization_url } = await res.json();
+
+  // Open authorization_url in WebBrowser / ASWebAuthenticationSession
+  // On deep link stravaapp://auth?code=...:
+  const tokenRes = await fetch(`${API_BASE}/api/auth/strava/token/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code }),
+  });
+  const { access, refresh, athlete_id } = await tokenRes.json();
+  await SecureStore.setItemAsync('access_token', access);
+  await SecureStore.setItemAsync('refresh_token', refresh);
+}
+```
+
+---
+
+### Legacy: WebView JSON interception
+
+Without `mobile=1`, the callback returns JSON. The mobile app must intercept the HTTP callback URL inside the in-app browser.
 
 #### Callback URL pattern to intercept
 
@@ -382,8 +484,8 @@ curl -H "Authorization: Bearer <access_token>" \
 | No token stored | — | Show login screen |
 | `401` on API call | 401 | Try `POST /api/auth/token/refresh/` |
 | Refresh also fails | 401 | Clear tokens, show login screen |
-| `Invalid OAuth state` | 400 | Restart login from step 1 |
-| User denied Strava access | redirect with `?error=access_denied` | Show "Authorization denied" message |
+| `Invalid OAuth state` | 400 / deep link `?error=invalid_state` | Restart login from step 1 |
+| User denied Strava access | deep link `?error=access_denied` or JSON | Show "Authorization denied" message |
 | Network error | — | Show retry UI |
 | Strava rate limit | 429 | Show "Try again later" |
 
@@ -397,7 +499,8 @@ These are configured server-side; mobile app does not need Strava credentials.
 |---------|-------|
 | Strava Client ID | `31927` |
 | OAuth scope | `read` |
-| Redirect URI | `http://13.51.255.182:8080/api/auth/strava/callback` |
+| Redirect URI (Strava) | `http://13.51.255.182:8080/api/auth/strava/callback` |
+| Mobile deep link URI | `stravaapp://auth` (`MOBILE_AUTH_REDIRECT_URI`) |
 | Strava authorize URL | `https://www.strava.com/oauth/authorize` |
 
 ---
@@ -406,10 +509,10 @@ These are configured server-side; mobile app does not need Strava credentials.
 
 The following are **not yet implemented** on the backend. Mobile app should be aware:
 
-| Feature | Status | Workaround |
-|---------|--------|------------|
-| `POST /api/auth/strava/token/` (send code directly) | Not implemented | Use WebView URL interception |
-| Deep link redirect (`myapp://auth?token=...`) | Not implemented | Use WebView URL interception |
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Deep link redirect (`stravaapp://auth?code=...`) | Implemented | Use `mobile=1` at login |
+| `POST /api/auth/strava/token/` | Implemented | Exchange one-time code for JWT |
 | Activities list endpoint | Not implemented | Only `/api/athlete/` available |
 | HTTPS | Not configured | Required before production release |
 
@@ -424,13 +527,15 @@ sequenceDiagram
     participant Browser as InApp_Browser
     participant Strava as Strava
 
-    Mobile->>API: GET /api/auth/strava/login/?format=json
+    Mobile->>API: GET /api/auth/strava/login/?format=json&mobile=1
     API-->>Mobile: { authorization_url }
     Mobile->>Browser: Open authorization_url
     Browser->>Strava: User logs in and authorizes
     Strava->>API: GET /api/auth/strava/callback?code&state
-    API-->>Browser: { access, refresh, athlete_id }
-    Browser-->>Mobile: Intercept callback URL / read JSON
+    API-->>Browser: 302 stravaapp://auth?code=...
+    Browser-->>Mobile: OS opens app via deep link
+    Mobile->>API: POST /api/auth/strava/token/ { code }
+    API-->>Mobile: { access, refresh, athlete_id }
     Mobile->>Mobile: Save tokens to secure storage
     Mobile->>API: GET /api/athlete/ (Authorization: Bearer ...)
     API-->>Mobile: Athlete profile JSON
